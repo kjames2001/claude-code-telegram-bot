@@ -23,25 +23,29 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
 SESSIONS_DIR = Path("/root/telegram-claude-bot/sessions")
 CLAUDE_BIN = "/root/.local/bin/claude"
-CLAUDE_TIMEOUT = 900  # seconds (15 minutes)
+CLAUDE_TIMEOUT      = 3600  # hard wall-clock cap (1 hour emergency backstop)
+CLAUDE_IDLE_TIMEOUT = 60    # kill if no output for this many seconds (1 minute)
 MEMORY_DIR = Path("/root/.claude/projects/-root/memory")
 
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+UPLOADS_DIR = Path("/tmp/telegram-uploads")
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Emoji shown while Claude is working — keyed by the tool Claude is currently calling.
-# None = Claude is generating text (no active tool call).
-TOOL_EMOJIS: dict[str | None, str] = {
-    None:          "🤔",  # thinking / writing
-    "Read":        "📖",  # reading a file
-    "Write":       "💾",  # writing a file
-    "Edit":        "✏️",  # editing a file
-    "Bash":        "⚡",  # running a shell command
-    "Grep":        "🔍",  # searching file contents
-    "Glob":        "📂",  # finding files
-    "Agent":       "🤖",  # spawning a sub-agent
-    "WebFetch":    "🌐",  # fetching a URL
-    "WebSearch":   "🔎",  # web search
-    "Task":        "📋",  # task management
+
+# Single animated emoji per tool — Telegram renders these as GIF animations
+# when the message contains only the emoji character.
+TOOL_EMOJI: dict[str | None, str] = {
+    None:          "🤔",   # thinking / writing
+    "Read":        "👀",   # reading a file
+    "Write":       "✍️",   # writing a file
+    "Edit":        "✏️",   # editing a file
+    "Bash":        "⚡",   # running a shell command
+    "Grep":        "🔍",   # searching file contents
+    "Glob":        "📂",   # finding files
+    "Agent":       "🤖",   # spawning a sub-agent
+    "WebFetch":    "🌐",   # fetching a URL
+    "WebSearch":   "🔎",   # web search
+    "Task":        "📋",   # task management
     "TaskCreate":  "📋",
     "TaskUpdate":  "📋",
     "TaskGet":     "📋",
@@ -50,8 +54,7 @@ TOOL_EMOJIS: dict[str | None, str] = {
     "TodoRead":    "📝",
     "NotebookEdit":"📓",
 }
-DEFAULT_TOOL_EMOJI = "⚙️"   # fallback for unknown tools
-STATUS_INTERVAL = 8          # seconds between status nudges
+DEFAULT_TOOL_EMOJI = "⚙️"  # fallback for unknown tools
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -75,8 +78,17 @@ def load_memory() -> str:
     """Read all memory files and return combined context string."""
     if not MEMORY_DIR.exists():
         return ""
+    # Skip large/sensitive files that bloat the system prompt unnecessarily.
+    SKIP_FILES = {
+        "reference_ssh_key.md", "reference_credentials.md",
+        "MEMORY.md", "last_session.md",
+        "feedback_session_continuity.md", "feedback_session_summary.md",
+        "feedback_cleanup.md", "feedback_webfetch.md",
+    }
     parts = []
     for md_file in sorted(MEMORY_DIR.glob("*.md")):
+        if md_file.name in SKIP_FILES:
+            continue
         content = md_file.read_text().strip()
         if content:
             parts.append(f"## [{md_file.name}]\n{content}")
@@ -97,8 +109,34 @@ def load_session_id(chat_id: int) -> str | None:
     return None
 
 
+def load_status_msg_id(chat_id: int) -> int | None:
+    f = session_file(chat_id)
+    if f.exists():
+        return json.loads(f.read_text()).get("status_msg_id")
+    return None
+
+
 def save_session_id(chat_id: int, session_id: str):
-    session_file(chat_id).write_text(json.dumps({"session_id": session_id}))
+    f = session_file(chat_id)
+    data = json.loads(f.read_text()) if f.exists() else {}
+    data["session_id"] = session_id
+    data.pop("status_msg_id", None)
+    f.write_text(json.dumps(data))
+
+
+def save_status_msg_id(chat_id: int, msg_id: int):
+    f = session_file(chat_id)
+    data = json.loads(f.read_text()) if f.exists() else {}
+    data["status_msg_id"] = msg_id
+    f.write_text(json.dumps(data))
+
+
+def clear_status_msg_id(chat_id: int):
+    f = session_file(chat_id)
+    if f.exists():
+        data = json.loads(f.read_text())
+        data.pop("status_msg_id", None)
+        f.write_text(json.dumps(data))
 
 
 def clear_session(chat_id: int):
@@ -146,6 +184,8 @@ async def run_claude(
     new_session_id: str | None = None
     is_error = False
     stderr_buf: list[bytes] = []
+    last_activity: list[float] = [asyncio.get_event_loop().time()]
+    idle_timed_out: list[bool] = [False]
 
     async def read_stdout():
         nonlocal result_text, new_session_id, is_error
@@ -158,6 +198,7 @@ async def run_claude(
             chunk = await proc.stdout.read(131072)  # 128 KB at a time
             if not chunk:
                 break
+            last_activity[0] = asyncio.get_event_loop().time()
             buf += chunk
             while b"\n" in buf:
                 raw, buf = buf.split(b"\n", 1)
@@ -186,9 +227,21 @@ async def run_claude(
         data = await proc.stderr.read()
         stderr_buf.append(data)
 
+    async def idle_watchdog():
+        """Kill the process if no output received for CLAUDE_IDLE_TIMEOUT seconds."""
+        while True:
+            await asyncio.sleep(10)
+            if current_tool[0] == "done":
+                return
+            idle = asyncio.get_event_loop().time() - last_activity[0]
+            if idle >= CLAUDE_IDLE_TIMEOUT:
+                idle_timed_out[0] = True
+                proc.kill()
+                return
+
     try:
         await asyncio.wait_for(
-            asyncio.gather(read_stdout(), drain_stderr(), proc.wait()),
+            asyncio.gather(read_stdout(), drain_stderr(), proc.wait(), idle_watchdog()),
             timeout=CLAUDE_TIMEOUT,
         )
     except asyncio.TimeoutError:
@@ -197,7 +250,9 @@ async def run_claude(
             await asyncio.wait_for(proc.wait(), timeout=5.0)
         except asyncio.TimeoutError:
             pass
-        raise TimeoutError("Claude timed out")
+        if idle_timed_out[0]:
+            raise TimeoutError(f"Claude stopped responding (no output for {CLAUDE_IDLE_TIMEOUT // 60} min)")
+        raise TimeoutError("Claude exceeded the maximum time limit")
     finally:
         active_procs.pop(chat_id, None)
 
@@ -244,6 +299,7 @@ TOOL_LABELS: dict[str | None, str] = {
     "NotebookEdit":"editing notebook",
 }
 
+
 async def status_updater(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -252,37 +308,38 @@ async def status_updater(
     status_msg_id: list,   # 1-element list; populated here once message is sent
 ):
     """
-    Send one status message, then edit it in-place as Claude's active tool changes.
-    Also refreshes the 'typing' chat action every 4s so the indicator stays visible.
+    Send one status message — emoji + label + elapsed time.
+    Updates every 10 seconds or when the tool changes, keeping API calls low.
     """
-    EDIT_INTERVAL = 3     # seconds between edits
-    TYPING_INTERVAL = 4   # seconds between typing action refreshes
+    TYPING_INTERVAL = 4    # seconds between typing action refreshes
+    EDIT_INTERVAL = 10     # seconds between elapsed-time updates
 
     await asyncio.sleep(1)   # brief pause so the status msg appears after the user's msg
 
-    # Send the initial status message and record its id
+    start_time = asyncio.get_event_loop().time()
     tool = current_tool[0]
-    emoji = TOOL_EMOJIS.get(tool, DEFAULT_TOOL_EMOJI)
-    label = TOOL_LABELS.get(tool, "working")
+    initial_text = f"{TOOL_EMOJI.get(tool, DEFAULT_TOOL_EMOJI)} {TOOL_LABELS.get(tool, 'working')}"
     try:
-        msg = await context.bot.send_message(chat_id=chat_id, text=f"{emoji} {label}…")
+        msg = await context.bot.send_message(chat_id=chat_id, text=initial_text)
         status_msg_id[0] = msg.message_id
+        save_status_msg_id(chat_id, msg.message_id)
     except Exception:
         return
 
-    last_text = f"{emoji} {label}…"
-    last_edit = asyncio.get_event_loop().time()
-    last_typing = last_edit
+    last_tool = tool
+    last_text = initial_text
+    last_typing = start_time
+    last_edit = start_time
 
     while not done.is_set():
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(1)
         now = asyncio.get_event_loop().time()
 
         tool = current_tool[0]
         if tool == "done":
             break
 
-        # Refresh typing indicator every 4s
+        # Refresh typing indicator periodically
         if now - last_typing >= TYPING_INTERVAL:
             try:
                 await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
@@ -290,21 +347,28 @@ async def status_updater(
                 pass
             last_typing = now
 
-        # Edit status message every 3s if content changed or interval elapsed
-        emoji = TOOL_EMOJIS.get(tool, DEFAULT_TOOL_EMOJI)
-        label = TOOL_LABELS.get(tool, "working")
-        new_text = f"{emoji} {label}…"
-        if new_text != last_text and now - last_edit >= EDIT_INTERVAL:
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=status_msg_id[0],
-                    text=new_text,
-                )
-                last_text = new_text
-            except Exception:
-                pass
+        # Update on tool change or every EDIT_INTERVAL for elapsed time
+        tool_changed = tool != last_tool
+        time_to_update = now - last_edit >= EDIT_INTERVAL
+        if tool_changed or time_to_update:
+            elapsed = int(now - start_time)
+            elapsed_str = f"{elapsed // 60}m {elapsed % 60}s" if elapsed >= 60 else f"{elapsed}s"
+            emoji = TOOL_EMOJI.get(tool, DEFAULT_TOOL_EMOJI)
+            label = TOOL_LABELS.get(tool, "working")
+            new_text = f"{emoji} {label} — {elapsed_str}"
+            if new_text != last_text:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=status_msg_id[0],
+                        text=new_text,
+                    )
+                    last_text = new_text
+                except Exception:
+                    pass
+            last_tool = tool
             last_edit = now
+            last_tool = tool
 
 # ── Handlers ───────────────────────────────────────────────────────────────────
 
@@ -446,10 +510,13 @@ async def _run_with_updates(
             await updater
         except asyncio.CancelledError:
             pass
-        # Delete the status message so the chat stays clean
-        if status_msg_id[0] is not None:
+        # Delete the status message so the chat stays clean.
+        # Also clears the persisted ID so restarts don't try to re-delete it.
+        mid = status_msg_id[0]
+        if mid is not None:
+            clear_status_msg_id(chat_id)
             try:
-                await context.bot.delete_message(chat_id=chat_id, message_id=status_msg_id[0])
+                await context.bot.delete_message(chat_id=chat_id, message_id=mid)
             except Exception:
                 pass
     return result
@@ -457,7 +524,10 @@ async def _run_with_updates(
 
 async def _process_one(chat_id: int, text: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Process a single message. Called sequentially by chat_worker."""
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    except Exception:
+        pass
     session_id = load_session_id(chat_id)
     log.info("chat=%s session=%s msg=%r", chat_id, session_id, text[:60])
     busy_chats.add(chat_id)
@@ -471,8 +541,25 @@ async def _process_one(chat_id: int, text: str, update: Update, context: Context
             await send_images(chat_id, images, update, context)
     except CancelledError:
         await update.message.reply_text("Cancelled.")
-    except TimeoutError:
-        await update.message.reply_text("⏱️ Timed out waiting for Claude. Try again.")
+    except TimeoutError as e:
+        if session_id:
+            log.warning("Timeout on session %s, retrying fresh", session_id)
+            clear_session(chat_id)
+            try:
+                response, new_session_id = await _run_with_updates(update, context, text, None)
+                save_session_id(chat_id, new_session_id)
+                for chunk in _split(response, 4096):
+                    await update.message.reply_text(chunk)
+                images = extract_images(response)
+                if images:
+                    await send_images(chat_id, images, update, context)
+            except CancelledError:
+                await update.message.reply_text("Cancelled.")
+            except Exception as e2:
+                log.error("Error on fresh retry after timeout: %s", e2)
+                await update.message.reply_text(f"Error: {e2}")
+        else:
+            await update.message.reply_text(f"⏱️ {e}. You can /cancel and try again.")
     except RuntimeError as e:
         if "No conversation found with session ID" in str(e) and session_id:
             log.warning("Stale session %s, retrying fresh", session_id)
@@ -517,16 +604,9 @@ async def _chat_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         chat_workers.pop(chat_id, None)
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not auth(update):
-        return
-
+async def _enqueue(text: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Push text into the per-chat queue and start a worker if needed."""
     chat_id = update.effective_chat.id
-    text = update.message.text.strip()
-
-    if not text:
-        return
-
     if chat_id not in chat_queues:
         chat_queues[chat_id] = asyncio.Queue()
     queue = chat_queues[chat_id]
@@ -542,6 +622,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     worker = chat_workers.get(chat_id)
     if worker is None or worker.done():
         chat_workers[chat_id] = asyncio.create_task(_chat_worker(chat_id, context))
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not auth(update):
+        return
+
+    text = update.message.text.strip()
+    if not text:
+        return
+
+    await _enqueue(text, update, context)
+
+
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not auth(update):
+        return
+
+    msg = update.message
+    caption = (msg.caption or "").strip()
+
+    if msg.document:
+        tg_file_id = msg.document.file_id
+        file_name = msg.document.file_name or "uploaded_file"
+    elif msg.photo:
+        photo = msg.photo[-1]  # highest resolution
+        tg_file_id = photo.file_id
+        file_name = f"photo_{photo.file_id[-8:]}.jpg"
+    else:
+        return
+
+    tg_file = await context.bot.get_file(tg_file_id)
+    dest = UPLOADS_DIR / file_name
+    await tg_file.download_to_drive(dest)
+
+    note = f"File uploaded: {dest}"
+    text = f"{caption}\n\n{note}" if caption else note
+
+    await _enqueue(text, update, context)
 
 
 def _split(text: str, size: int) -> list[str]:
@@ -594,12 +712,55 @@ async def cmd_claude_passthrough(update: Update, context: ContextTypes.DEFAULT_T
     args = " ".join(context.args) if context.args else ""
     text = f"/{cmd}" + (f" {args}" if args else "")
     # Reuse the normal message pipeline
-    update.message.text = text
-    await handle_message(update, context)
+    await _enqueue(text, update, context)
+
+
+async def cmd_sendfile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a file from the server to the user. Usage: /sendfile <path> [caption]"""
+    if not auth(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /sendfile <path> [optional caption]")
+        return
+    path = Path(context.args[0])
+    caption = " ".join(context.args[1:]) if len(context.args) > 1 else None
+    if not path.exists():
+        await update.message.reply_text(f"File not found: {path}")
+        return
+    size_mb = path.stat().st_size / 1_048_576
+    write_timeout = max(60, int(size_mb * 30))  # 30s per MB, min 60s
+    try:
+        with open(path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=f,
+                filename=path.name,
+                caption=caption,
+                write_timeout=write_timeout,
+                read_timeout=write_timeout,
+            )
+    except Exception as e:
+        await update.message.reply_text(f"Failed to send: {e}")
 
 
 async def post_init(app) -> None:
-    """Register all commands in the Telegram menu button."""
+    """Clean up leftover status badges from before a restart, then register commands."""
+    # On restart, any in-flight status message was left orphaned — clean it up now.
+    for session_file_path in SESSIONS_DIR.glob("*.json"):
+        try:
+            data = json.loads(session_file_path.read_text())
+            mid = data.get("status_msg_id")
+            chat_id = int(session_file_path.stem)
+            if mid is not None:
+                try:
+                    await app.bot.delete_message(chat_id=chat_id, message_id=mid)
+                except Exception:
+                    pass
+                data.pop("status_msg_id", None)
+                session_file_path.write_text(json.dumps(data))
+        except Exception:
+            pass
+
     bot_commands = [
         # Bot-native commands
         BotCommand("help",    "Show available commands"),
@@ -617,6 +778,7 @@ async def post_init(app) -> None:
         BotCommand("review",  "Review recent code changes"),
         BotCommand("init",    "Initialize Claude Code in current directory"),
         BotCommand("bug",     "Report a bug to Anthropic"),
+        BotCommand("sendfile", "Send a file from the server"),
     ]
     await app.bot.set_my_commands(bot_commands)
     log.info("Registered %d commands in Telegram menu", len(bot_commands))
@@ -625,17 +787,27 @@ async def post_init(app) -> None:
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .post_init(post_init)
+        .build()
+    )
     app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("help",    cmd_help))
     app.add_handler(CommandHandler("reset",   cmd_reset))
     app.add_handler(CommandHandler("cancel",  cmd_cancel))
     app.add_handler(CommandHandler("status",  cmd_status))
     app.add_handler(CommandHandler("id",      cmd_id))
+    app.add_handler(CommandHandler("sendfile", cmd_sendfile))
     # Claude Code passthrough commands
     for cmd in CLAUDE_CODE_COMMANDS:
         app.add_handler(CommandHandler(cmd, cmd_claude_passthrough))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_file))
     log.info("Bot started. Allowed user ID: %s", ALLOWED_USER_ID)
     app.run_polling()
 
