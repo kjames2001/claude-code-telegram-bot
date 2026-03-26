@@ -398,14 +398,17 @@ async def status_updater(
         msg = await context.bot.send_message(chat_id=chat_id, text=initial_text)
         status_msg_id[0] = msg.message_id
         save_status_msg_id(chat_id, msg.message_id)
-    except Exception:
+    except Exception as e:
+        log.warning("status_updater: failed to send initial badge: %s", e)
         return
 
+    REASONING_INTERVAL = 30  # min seconds between reasoning messages
     last_tool = tool
     last_thinking = None
     last_text = initial_text
     last_typing = start_time
     last_edit = start_time
+    last_reasoning_send = 0.0
 
     while not done.is_set():
         await asyncio.sleep(1)
@@ -423,15 +426,17 @@ async def status_updater(
                 pass
             last_typing = now
 
-        # Send new reasoning blocks as separate messages (never edit/replace old ones)
+        # Send new reasoning blocks as separate messages, rate-limited to avoid flooding
         thinking = current_thinking[0]
-        if thinking and thinking != last_thinking:
+        if thinking and thinking != last_thinking and now - last_reasoning_send >= REASONING_INTERVAL:
             last_thinking = thinking
+            last_reasoning_send = now
             for chunk in _split(thinking[:10000], 4096):
                 try:
                     await context.bot.send_message(chat_id=chat_id, text=f"💭 {chunk}")
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning("status_updater: failed to send reasoning: %s", e)
+                    break
 
         # Update status badge on tool change or every EDIT_INTERVAL for elapsed time
         tool_changed = tool != last_tool
