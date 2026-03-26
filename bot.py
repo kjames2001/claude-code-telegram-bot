@@ -165,6 +165,37 @@ def clear_session(chat_id: int):
     if f.exists():
         f.unlink()
 
+
+def save_pending_task(chat_id: int, text: str):
+    f = session_file(chat_id)
+    data = json.loads(f.read_text()) if f.exists() else {}
+    data["pending_task"] = text
+    f.write_text(json.dumps(data))
+
+
+def clear_pending_task(chat_id: int):
+    f = session_file(chat_id)
+    if not f.exists():
+        return
+    data = json.loads(f.read_text())
+    if "pending_task" in data:
+        data.pop("pending_task")
+        f.write_text(json.dumps(data))
+
+
+def load_all_pending_tasks() -> list[tuple[int, str]]:
+    """Return (chat_id, text) for any tasks that were in-flight when the bot last stopped."""
+    tasks = []
+    for sf in SESSIONS_DIR.glob("*.json"):
+        try:
+            data = json.loads(sf.read_text())
+            text = data.get("pending_task")
+            if text:
+                tasks.append((int(sf.stem), text))
+        except Exception:
+            pass
+    return tasks
+
 # ── Claude runner ──────────────────────────────────────────────────────────────
 
 class CancelledError(Exception):
@@ -579,13 +610,12 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _run_with_updates(
-    update: Update,
+    chat_id: int,
     context: ContextTypes.DEFAULT_TYPE,
     text: str,
     session_id: str | None,
 ) -> tuple[str, str]:
     """Run claude with a single editable status message reflecting the active tool."""
-    chat_id = update.effective_chat.id
     done = asyncio.Event()
     current_tool: list = [None]     # shared mutable state: None = thinking
     current_thinking: list = [None] # latest reasoning text from Claude
@@ -614,8 +644,8 @@ async def _run_with_updates(
     return result
 
 
-async def _process_one(chat_id: int, text: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Process a single message. Called sequentially by chat_worker."""
+async def _process_one(chat_id: int, text: str, update: Update | None, context: ContextTypes.DEFAULT_TYPE):
+    """Process a single message. update may be None for auto-resumed tasks."""
     try:
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     except Exception:
@@ -623,19 +653,27 @@ async def _process_one(chat_id: int, text: str, update: Update, context: Context
     session_id = load_session_id(chat_id)
     log.info("chat=%s session=%s msg=%r", chat_id, session_id, text[:60])
     busy_chats.add(chat_id)
-    async def reply(text: str):
-        await send_with_retry(lambda: update.message.reply_text(text))
+    save_pending_task(chat_id, text)
+
+    async def reply(msg: str):
+        if update is not None:
+            await send_with_retry(lambda: update.message.reply_text(msg))
+        else:
+            await send_with_retry(lambda: context.bot.send_message(chat_id=chat_id, text=msg))
 
     async def deliver(response: str, new_session_id: str):
         save_session_id(chat_id, new_session_id)
         for chunk in _split(response, 4096):
-            await send_with_retry(lambda c=chunk: update.message.reply_text(c))
+            if update is not None:
+                await send_with_retry(lambda c=chunk: update.message.reply_text(c))
+            else:
+                await send_with_retry(lambda c=chunk: context.bot.send_message(chat_id=chat_id, text=c))
         images = extract_images(response)
         if images:
             await send_images(chat_id, images, update, context)
 
     try:
-        response, new_session_id = await _run_with_updates(update, context, text, session_id)
+        response, new_session_id = await _run_with_updates(chat_id, context, text, session_id)
         await deliver(response, new_session_id)
     except CancelledError:
         if chat_id not in interrupted_chats:
@@ -649,7 +687,7 @@ async def _process_one(chat_id: int, text: str, update: Update, context: Context
             log.warning("Timeout on session %s, retrying fresh", session_id)
             clear_session(chat_id)
             try:
-                response, new_session_id = await _run_with_updates(update, context, text, None)
+                response, new_session_id = await _run_with_updates(chat_id, context, text, None)
                 await deliver(response, new_session_id)
             except CancelledError:
                 if chat_id not in interrupted_chats:
@@ -674,7 +712,7 @@ async def _process_one(chat_id: int, text: str, update: Update, context: Context
             log.warning("Stale session %s, retrying fresh", session_id)
             clear_session(chat_id)
             try:
-                response, new_session_id = await _run_with_updates(update, context, text, None)
+                response, new_session_id = await _run_with_updates(chat_id, context, text, None)
                 await deliver(response, new_session_id)
             except CancelledError:
                 if chat_id not in interrupted_chats:
@@ -703,6 +741,7 @@ async def _process_one(chat_id: int, text: str, update: Update, context: Context
             pass
     finally:
         busy_chats.discard(chat_id)
+        clear_pending_task(chat_id)
 
 
 async def _chat_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -871,6 +910,12 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         log.error("Unhandled Telegram error: %s", err, exc_info=err)
 
 
+class _BotContext:
+    """Minimal context substitute used only for startup resume — wraps bot only."""
+    def __init__(self, bot):
+        self.bot = bot
+
+
 async def post_init(app) -> None:
     """Clean up leftover status badges from before a restart, then register commands."""
     # On restart, any in-flight status message was left orphaned — clean it up now.
@@ -910,6 +955,26 @@ async def post_init(app) -> None:
     ]
     await app.bot.set_my_commands(bot_commands)
     log.info("Registered %d commands in Telegram menu", len(bot_commands))
+
+    # Schedule resume of any in-flight tasks from before the restart
+    pending = load_all_pending_tasks()
+    if pending:
+        async def _do_resume():
+            await asyncio.sleep(3)  # let run_polling start first
+            ctx = _BotContext(app.bot)
+            for chat_id, text in pending:
+                log.info("Resuming pending task for chat %s: %r", chat_id, text[:60])
+                try:
+                    await app.bot.send_message(chat_id=chat_id, text="⚠️ Bot restarted — resuming your last request…")
+                except Exception:
+                    pass
+                if chat_id not in chat_queues:
+                    chat_queues[chat_id] = asyncio.Queue()
+                await chat_queues[chat_id].put((text, None))
+                worker = chat_workers.get(chat_id)
+                if worker is None or worker.done():
+                    chat_workers[chat_id] = asyncio.create_task(_chat_worker(chat_id, ctx))
+        asyncio.create_task(_do_resume())
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
