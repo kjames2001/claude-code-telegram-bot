@@ -201,6 +201,9 @@ def load_all_pending_tasks() -> list[tuple[int, str]]:
 class CancelledError(Exception):
     pass
 
+class ContextLimitError(Exception):
+    pass
+
 
 async def run_claude(
     message: str,
@@ -373,7 +376,10 @@ async def run_claude(
         log.warning("claude exited %s but result was already received — treating as success", proc.returncode)
 
     if is_error:
-        raise RuntimeError(result_text or "Unknown error from claude")
+        msg = result_text or "Unknown error from claude"
+        if any(kw in msg.lower() for kw in ("context_length", "too long", "context window", "context limit", "token limit", "prompt is too long")):
+            raise ContextLimitError(msg)
+        raise RuntimeError(msg)
 
     if result_text is None:
         raise RuntimeError("No result received from claude")
@@ -703,6 +709,22 @@ async def _process_one(chat_id: int, text: str, update: Update | None, context: 
     try:
         response, new_session_id = await _run_with_updates(chat_id, context, text, session_id)
         await deliver(response, new_session_id)
+    except ContextLimitError:
+        log.info("Context limit hit for chat %s — auto-compacting session %s", chat_id, session_id)
+        try:
+            await reply("📦 Context limit reached — compacting session and retrying…")
+        except Exception:
+            pass
+        try:
+            _, compacted_session_id = await _run_with_updates(chat_id, context, "/compact", session_id)
+            response, new_session_id = await _run_with_updates(chat_id, context, text, compacted_session_id)
+            await deliver(response, new_session_id)
+        except Exception as e:
+            log.error("Failed to recover from context limit: %s", e)
+            try:
+                await reply(f"⚠️ Context limit hit and compact failed: {e}")
+            except Exception:
+                pass
     except CancelledError:
         if chat_id not in interrupted_chats:
             try:
