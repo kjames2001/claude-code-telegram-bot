@@ -600,9 +600,8 @@ async def cmd_droplast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         queue._queue.pop()  # remove last item from the internal deque
-        queue.task_done()
-    except Exception:
-        await update.message.reply_text("Nothing to remove.")
+    except IndexError:
+        await update.message.reply_text("No queued messages.")
         return
     remaining = queue.qsize()
     msg = "Last queued message removed."
