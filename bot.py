@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import signal
+from datetime import datetime, timezone
 from pathlib import Path
 
 from telegram import BotCommand, Update
@@ -204,6 +205,36 @@ class CancelledError(Exception):
 class ContextLimitError(Exception):
     pass
 
+class RateLimitError(Exception):
+    """Raised when the Anthropic daily/weekly token quota is exhausted."""
+    def __init__(self, message: str, retry_after: float):
+        super().__init__(message)
+        self.retry_after = retry_after  # seconds to wait before retrying
+
+
+def _parse_retry_after(error_msg: str) -> float:
+    """
+    Parse seconds-until-retry from an Anthropic rate limit error message.
+    Looks for ISO timestamps (e.g. 'retry after 2026-03-27T00:00:00Z')
+    or human durations ('after 2 hours'). Falls back to 1 hour.
+    """
+    # ISO 8601 timestamp: "2026-03-27T00:00:00Z" or "2026-03-27T00:00:00+00:00"
+    ts_match = re.search(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})', error_msg)
+    if ts_match:
+        try:
+            ts = datetime.fromisoformat(ts_match.group().replace("Z", "+00:00"))
+            delay = (ts - datetime.now(timezone.utc)).total_seconds()
+            return max(delay, 60)
+        except Exception:
+            pass
+    # "after X hours/minutes/seconds"
+    dur_match = re.search(r'after\s+(\d+(?:\.\d+)?)\s*(hour|minute|second)s?', error_msg, re.IGNORECASE)
+    if dur_match:
+        value, unit = float(dur_match.group(1)), dur_match.group(2).lower()
+        multiplier = {"hour": 3600, "minute": 60, "second": 1}.get(unit, 1)
+        return max(value * multiplier, 60)
+    return 3600  # default: wait 1 hour
+
 
 async def run_claude(
     message: str,
@@ -377,8 +408,11 @@ async def run_claude(
 
     if is_error:
         msg = result_text or "Unknown error from claude"
-        if any(kw in msg.lower() for kw in ("context_length", "too long", "context window", "context limit", "token limit", "prompt is too long")):
+        if any(kw in msg.lower() for kw in ("context_length", "too long", "context window", "context limit", "prompt is too long")):
             raise ContextLimitError(msg)
+        if any(kw in msg.lower() for kw in ("rate_limit", "daily", "weekly", "usage limit", "quota", "token limit", "exceeded your")):
+            retry_after = _parse_retry_after(msg)
+            raise RateLimitError(msg, retry_after)
         raise RuntimeError(msg)
 
     if result_text is None:
@@ -709,6 +743,30 @@ async def _process_one(chat_id: int, text: str, update: Update | None, context: 
     try:
         response, new_session_id = await _run_with_updates(chat_id, context, text, session_id)
         await deliver(response, new_session_id)
+    except RateLimitError as e:
+        wait = e.retry_after
+        if wait >= 3600:
+            wait_str = f"{wait / 3600:.1f}h"
+        elif wait >= 60:
+            wait_str = f"{wait / 60:.0f}m"
+        else:
+            wait_str = f"{wait:.0f}s"
+        log.warning("Rate limit hit for chat %s — retrying in %s", chat_id, wait_str)
+        try:
+            await reply(f"⏳ Token limit reached — will retry automatically in {wait_str}.")
+        except Exception:
+            pass
+
+        async def _delayed_retry():
+            await asyncio.sleep(wait)
+            if chat_id not in chat_queues:
+                chat_queues[chat_id] = asyncio.Queue()
+            await chat_queues[chat_id].put((text, None))
+            worker = chat_workers.get(chat_id)
+            if worker is None or worker.done():
+                chat_workers[chat_id] = asyncio.create_task(_chat_worker(chat_id, context))
+
+        asyncio.create_task(_delayed_retry())
     except ContextLimitError:
         log.info("Context limit hit for chat %s — auto-compacting session %s", chat_id, session_id)
         try:
