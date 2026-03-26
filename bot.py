@@ -718,28 +718,11 @@ async def _chat_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _enqueue(text: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Push text into the per-chat queue, interrupting any current run first."""
+    """Push text into the per-chat queue and start a worker if needed."""
     chat_id = update.effective_chat.id
     if chat_id not in chat_queues:
         chat_queues[chat_id] = asyncio.Queue()
     queue = chat_queues[chat_id]
-
-    if chat_id in busy_chats:
-        # Clear any previously queued messages
-        while not queue.empty():
-            try:
-                queue.get_nowait()
-                queue.task_done()
-            except asyncio.QueueEmpty:
-                break
-        # Kill the running process — _process_one will suppress "Cancelled." for us
-        proc = active_procs.get(chat_id)
-        if proc:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-        interrupted_chats.add(chat_id)
 
     await queue.put((text, update))
 
