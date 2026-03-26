@@ -425,12 +425,19 @@ async def status_updater(
     start_time = asyncio.get_event_loop().time()
     tool = current_tool[0]
     initial_text = f"{TOOL_EMOJI.get(tool, DEFAULT_TOOL_EMOJI)} {TOOL_LABELS.get(tool, 'working')}"
-    try:
-        msg = await context.bot.send_message(chat_id=chat_id, text=initial_text)
-        status_msg_id[0] = msg.message_id
-        save_status_msg_id(chat_id, msg.message_id)
-    except Exception as e:
-        log.warning("status_updater: failed to send initial badge: %s", e)
+    msg = None
+    for attempt in range(4):
+        try:
+            msg = await context.bot.send_message(chat_id=chat_id, text=initial_text)
+            status_msg_id[0] = msg.message_id
+            save_status_msg_id(chat_id, msg.message_id)
+            break
+        except Exception as e:
+            log.warning("status_updater: badge send attempt %d failed: %s", attempt + 1, e)
+            if attempt < 3:
+                await asyncio.sleep(5 * (attempt + 1))
+    if msg is None:
+        log.warning("status_updater: giving up on badge after 4 attempts")
         return
 
     REASONING_INTERVAL = 30  # min seconds between reasoning messages
@@ -984,7 +991,9 @@ def main():
         ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
         .connect_timeout(15)
-        .read_timeout(30)
+        .read_timeout(60)
+        .write_timeout(30)
+        .pool_timeout(10)
         .get_updates_connect_timeout(15)
         .get_updates_read_timeout(35)   # must exceed run_polling(timeout=...) — default is 0 but PTB adds buffer
         .post_init(post_init)
