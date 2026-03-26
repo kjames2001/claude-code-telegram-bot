@@ -72,6 +72,8 @@ busy_chats: set[int] = set()
 chat_queues: dict[int, asyncio.Queue] = {}
 # chat_id -> asyncio.Task (per-chat worker draining the queue)
 chat_workers: dict[int, asyncio.Task] = {}
+# chats where the current run was auto-interrupted by a new message (suppress "Cancelled." reply)
+interrupted_chats: set[int] = set()
 
 # ── Memory loader ──────────────────────────────────────────────────────────────
 
@@ -421,23 +423,25 @@ async def status_updater(
                 pass
             last_typing = now
 
-        # Update on tool change or every EDIT_INTERVAL for elapsed time
+        # Send new reasoning blocks as separate messages (never edit/replace old ones)
+        thinking = current_thinking[0]
+        if thinking and thinking != last_thinking:
+            last_thinking = thinking
+            for chunk in _split(thinking[:10000], 4096):
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=f"💭 {chunk}")
+                except Exception:
+                    pass
+
+        # Update status badge on tool change or every EDIT_INTERVAL for elapsed time
         tool_changed = tool != last_tool
-        thinking_changed = current_thinking[0] != last_thinking
         time_to_update = now - last_edit >= EDIT_INTERVAL
-        if tool_changed or thinking_changed or time_to_update:
+        if tool_changed or time_to_update:
             elapsed = int(now - start_time)
             elapsed_str = f"{elapsed // 60}m {elapsed % 60}s" if elapsed >= 60 else f"{elapsed}s"
             emoji = TOOL_EMOJI.get(tool, DEFAULT_TOOL_EMOJI)
             label = TOOL_LABELS.get(tool, "working")
-            thinking = current_thinking[0]
-            if thinking:
-                preview = thinking.replace("\n", " ").strip()
-                if len(preview) > 200:
-                    preview = preview[:200] + "…"
-                new_text = f"{emoji} {label} — {elapsed_str}\n\n💭 {preview}"
-            else:
-                new_text = f"{emoji} {label} — {elapsed_str}"
+            new_text = f"{emoji} {label} — {elapsed_str}"
             if new_text != last_text:
                 try:
                     await context.bot.edit_message_text(
@@ -449,7 +453,6 @@ async def status_updater(
                 except Exception:
                     pass
             last_tool = tool
-            last_thinking = current_thinking[0]
             last_edit = now
 
 # ── Handlers ───────────────────────────────────────────────────────────────────
@@ -533,6 +536,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             proc.kill()
         except ProcessLookupError:
             pass
+        interrupted_chats.add(chat_id)  # suppress "Cancelled." from _process_one
 
     parts = []
     if proc:
@@ -629,10 +633,12 @@ async def _process_one(chat_id: int, text: str, update: Update, context: Context
         response, new_session_id = await _run_with_updates(update, context, text, session_id)
         await deliver(response, new_session_id)
     except CancelledError:
-        try:
-            await reply("Cancelled.")
-        except Exception:
-            pass
+        if chat_id not in interrupted_chats:
+            try:
+                await reply("Cancelled.")
+            except Exception:
+                pass
+        interrupted_chats.discard(chat_id)
     except TimeoutError as e:
         if session_id:
             log.warning("Timeout on session %s, retrying fresh", session_id)
@@ -641,10 +647,12 @@ async def _process_one(chat_id: int, text: str, update: Update, context: Context
                 response, new_session_id = await _run_with_updates(update, context, text, None)
                 await deliver(response, new_session_id)
             except CancelledError:
-                try:
-                    await reply("Cancelled.")
-                except Exception:
-                    pass
+                if chat_id not in interrupted_chats:
+                    try:
+                        await reply("Cancelled.")
+                    except Exception:
+                        pass
+                interrupted_chats.discard(chat_id)
             except Exception as e2:
                 log.error("Error on fresh retry after timeout: %s", e2)
                 try:
@@ -664,10 +672,12 @@ async def _process_one(chat_id: int, text: str, update: Update, context: Context
                 response, new_session_id = await _run_with_updates(update, context, text, None)
                 await deliver(response, new_session_id)
             except CancelledError:
-                try:
-                    await reply("Cancelled.")
-                except Exception:
-                    pass
+                if chat_id not in interrupted_chats:
+                    try:
+                        await reply("Cancelled.")
+                    except Exception:
+                        pass
+                interrupted_chats.discard(chat_id)
             except Exception as e2:
                 log.error("Error on retry: %s", e2)
                 try:
@@ -708,19 +718,30 @@ async def _chat_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _enqueue(text: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Push text into the per-chat queue and start a worker if needed."""
+    """Push text into the per-chat queue, interrupting any current run first."""
     chat_id = update.effective_chat.id
     if chat_id not in chat_queues:
         chat_queues[chat_id] = asyncio.Queue()
     queue = chat_queues[chat_id]
 
-    pending = queue.qsize() + (1 if chat_id in busy_chats else 0)
-    await queue.put((text, update))
+    if chat_id in busy_chats:
+        # Clear any previously queued messages
+        while not queue.empty():
+            try:
+                queue.get_nowait()
+                queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+        # Kill the running process — _process_one will suppress "Cancelled." for us
+        proc = active_procs.get(chat_id)
+        if proc:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        interrupted_chats.add(chat_id)
 
-    if pending > 0:
-        ahead = pending
-        msg = f"Queued — {ahead} request{'s' if ahead > 1 else ''} ahead."
-        await update.message.reply_text(msg)
+    await queue.put((text, update))
 
     worker = chat_workers.get(chat_id)
     if worker is None or worker.done():
