@@ -724,7 +724,12 @@ async def _enqueue(text: str, update: Update, context: ContextTypes.DEFAULT_TYPE
         chat_queues[chat_id] = asyncio.Queue()
     queue = chat_queues[chat_id]
 
+    pending = queue.qsize() + (1 if chat_id in busy_chats else 0)
     await queue.put((text, update))
+
+    if pending > 0:
+        ahead = pending
+        await update.message.reply_text(f"Queued — {ahead} request{'s' if ahead > 1 else ''} ahead.")
 
     worker = chat_workers.get(chat_id)
     if worker is None or worker.done():
