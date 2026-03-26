@@ -16,6 +16,7 @@ from pathlib import Path
 
 from telegram import BotCommand, Update
 from telegram.constants import ChatAction
+from telegram.error import NetworkError as TelegramNetworkError, TimedOut as TelegramTimedOut
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -96,6 +97,24 @@ def load_memory() -> str:
         return ""
     return "# Persistent Memory (auto-loaded)\n\n" + "\n\n".join(parts)
 
+# ── Network retry helper ───────────────────────────────────────────────────────
+
+async def send_with_retry(coro_fn, max_retries: int = 3, base_delay: float = 2.0):
+    """
+    Call coro_fn() (a coroutine factory) and retry on transient NetworkErrors.
+    Raises on final failure.
+    """
+    for attempt in range(max_retries):
+        try:
+            return await coro_fn()
+        except TelegramNetworkError as e:
+            if attempt == max_retries - 1:
+                raise
+            delay = base_delay * (2 ** attempt)
+            log.warning("NetworkError on send attempt %d/%d (%s) — retrying in %.0fs", attempt + 1, max_retries, e, delay)
+            await asyncio.sleep(delay)
+
+
 # ── Session helpers ────────────────────────────────────────────────────────────
 
 def session_file(chat_id: int) -> Path:
@@ -154,7 +173,8 @@ async def run_claude(
     message: str,
     session_id: str | None,
     chat_id: int,
-    current_tool: list,   # 1-element list used as a mutable shared reference
+    current_tool: list,    # 1-element list: current tool name or None/done
+    current_thinking: list, # 1-element list: latest reasoning text from Claude
 ) -> tuple[str, str]:
     """
     Run claude CLI asynchronously and return (response_text, new_session_id).
@@ -215,6 +235,19 @@ async def run_claude(
                             None,
                         )
                         current_tool[0] = tool_name  # None → generating text
+                        # Capture reasoning text (thinking block, or text before a tool call)
+                        for block in content:
+                            btype = block.get("type")
+                            if btype == "thinking":
+                                t = block.get("thinking", "").strip()
+                                if t:
+                                    current_thinking[0] = t
+                                break
+                            elif btype == "text":
+                                t = block.get("text", "").strip()
+                                if t:
+                                    current_thinking[0] = t
+                                break
                     elif etype == "result":
                         result_text = event.get("result")
                         new_session_id = event.get("session_id")
@@ -227,17 +260,55 @@ async def run_claude(
         data = await proc.stderr.read()
         stderr_buf.append(data)
 
+    def _proc_cpu_ticks(pid: int) -> int | None:
+        """Return cumulative CPU ticks for pid+children, or None if unreadable."""
+        try:
+            total = 0
+            for p in [pid] + _child_pids(pid):
+                with open(f"/proc/{p}/stat") as f:
+                    fields = f.read().split()
+                total += int(fields[13]) + int(fields[14])  # utime + stime
+            return total
+        except Exception:
+            return None
+
+    def _child_pids(pid: int) -> list[int]:
+        """Return immediate child PIDs of pid."""
+        children = []
+        try:
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                try:
+                    with open(f"/proc/{entry}/stat") as f:
+                        fields = f.read().split()
+                    if int(fields[3]) == pid:
+                        children.append(int(entry))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return children
+
     async def idle_watchdog():
-        """Kill the process if no output received for CLAUDE_IDLE_TIMEOUT seconds."""
+        """Kill the process only if truly stuck: no stdout AND no CPU activity."""
+        prev_cpu: int | None = None
         while True:
-            await asyncio.sleep(10)
+            await asyncio.sleep(30)
             if current_tool[0] == "done":
                 return
             idle = asyncio.get_event_loop().time() - last_activity[0]
-            if idle >= CLAUDE_IDLE_TIMEOUT:
+            if idle < CLAUDE_IDLE_TIMEOUT:
+                prev_cpu = None
+                continue
+            # No stdout for CLAUDE_IDLE_TIMEOUT — check CPU to confirm it's not just a slow tool
+            curr_cpu = _proc_cpu_ticks(proc.pid)
+            if curr_cpu is None or (prev_cpu is not None and curr_cpu == prev_cpu):
+                # CPU hasn't moved since last check — genuinely stuck
                 idle_timed_out[0] = True
                 proc.kill()
                 return
+            prev_cpu = curr_cpu
 
     try:
         await asyncio.wait_for(
@@ -305,14 +376,16 @@ async def status_updater(
     chat_id: int,
     done: asyncio.Event,
     current_tool: list,
+    current_thinking: list,
     status_msg_id: list,   # 1-element list; populated here once message is sent
 ):
     """
     Send one status message — emoji + label + elapsed time.
     Updates every 10 seconds or when the tool changes, keeping API calls low.
     """
-    TYPING_INTERVAL = 4    # seconds between typing action refreshes
-    EDIT_INTERVAL = 10     # seconds between elapsed-time updates
+    TYPING_INTERVAL = 5    # seconds between typing action refreshes (indicator lasts 5s)
+    EDIT_INTERVAL = 20     # seconds between elapsed-time updates
+    # Combined rate: 60/5 + 60/20 = 12+3 = ~15 API calls/min — safely under Telegram's 20/min per-chat limit.
 
     await asyncio.sleep(1)   # brief pause so the status msg appears after the user's msg
 
@@ -327,6 +400,7 @@ async def status_updater(
         return
 
     last_tool = tool
+    last_thinking = None
     last_text = initial_text
     last_typing = start_time
     last_edit = start_time
@@ -349,13 +423,21 @@ async def status_updater(
 
         # Update on tool change or every EDIT_INTERVAL for elapsed time
         tool_changed = tool != last_tool
+        thinking_changed = current_thinking[0] != last_thinking
         time_to_update = now - last_edit >= EDIT_INTERVAL
-        if tool_changed or time_to_update:
+        if tool_changed or thinking_changed or time_to_update:
             elapsed = int(now - start_time)
             elapsed_str = f"{elapsed // 60}m {elapsed % 60}s" if elapsed >= 60 else f"{elapsed}s"
             emoji = TOOL_EMOJI.get(tool, DEFAULT_TOOL_EMOJI)
             label = TOOL_LABELS.get(tool, "working")
-            new_text = f"{emoji} {label} — {elapsed_str}"
+            thinking = current_thinking[0]
+            if thinking:
+                preview = thinking.replace("\n", " ").strip()
+                if len(preview) > 200:
+                    preview = preview[:200] + "…"
+                new_text = f"{emoji} {label} — {elapsed_str}\n\n💭 {preview}"
+            else:
+                new_text = f"{emoji} {label} — {elapsed_str}"
             if new_text != last_text:
                 try:
                     await context.bot.edit_message_text(
@@ -367,8 +449,8 @@ async def status_updater(
                 except Exception:
                     pass
             last_tool = tool
+            last_thinking = current_thinking[0]
             last_edit = now
-            last_tool = tool
 
 # ── Handlers ───────────────────────────────────────────────────────────────────
 
@@ -496,13 +578,14 @@ async def _run_with_updates(
     """Run claude with a single editable status message reflecting the active tool."""
     chat_id = update.effective_chat.id
     done = asyncio.Event()
-    current_tool: list = [None]   # shared mutable state: None = thinking
-    status_msg_id: list = [None]  # filled by status_updater once message is sent
+    current_tool: list = [None]     # shared mutable state: None = thinking
+    current_thinking: list = [None] # latest reasoning text from Claude
+    status_msg_id: list = [None]    # filled by status_updater once message is sent
     updater = asyncio.create_task(
-        status_updater(context, chat_id, done, current_tool, status_msg_id)
+        status_updater(context, chat_id, done, current_tool, current_thinking, status_msg_id)
     )
     try:
-        result = await run_claude(text, session_id, chat_id, current_tool)
+        result = await run_claude(text, session_id, chat_id, current_tool, current_thinking)
     finally:
         done.set()
         updater.cancel()
@@ -531,58 +614,78 @@ async def _process_one(chat_id: int, text: str, update: Update, context: Context
     session_id = load_session_id(chat_id)
     log.info("chat=%s session=%s msg=%r", chat_id, session_id, text[:60])
     busy_chats.add(chat_id)
-    try:
-        response, new_session_id = await _run_with_updates(update, context, text, session_id)
+    async def reply(text: str):
+        await send_with_retry(lambda: update.message.reply_text(text))
+
+    async def deliver(response: str, new_session_id: str):
         save_session_id(chat_id, new_session_id)
         for chunk in _split(response, 4096):
-            await update.message.reply_text(chunk)
+            await send_with_retry(lambda c=chunk: update.message.reply_text(c))
         images = extract_images(response)
         if images:
             await send_images(chat_id, images, update, context)
+
+    try:
+        response, new_session_id = await _run_with_updates(update, context, text, session_id)
+        await deliver(response, new_session_id)
     except CancelledError:
-        await update.message.reply_text("Cancelled.")
+        try:
+            await reply("Cancelled.")
+        except Exception:
+            pass
     except TimeoutError as e:
         if session_id:
             log.warning("Timeout on session %s, retrying fresh", session_id)
             clear_session(chat_id)
             try:
                 response, new_session_id = await _run_with_updates(update, context, text, None)
-                save_session_id(chat_id, new_session_id)
-                for chunk in _split(response, 4096):
-                    await update.message.reply_text(chunk)
-                images = extract_images(response)
-                if images:
-                    await send_images(chat_id, images, update, context)
+                await deliver(response, new_session_id)
             except CancelledError:
-                await update.message.reply_text("Cancelled.")
+                try:
+                    await reply("Cancelled.")
+                except Exception:
+                    pass
             except Exception as e2:
                 log.error("Error on fresh retry after timeout: %s", e2)
-                await update.message.reply_text(f"Error: {e2}")
+                try:
+                    await reply(f"Error: {e2}")
+                except Exception:
+                    pass
         else:
-            await update.message.reply_text(f"⏱️ {e}. You can /cancel and try again.")
+            try:
+                await reply(f"⏱️ {e}. You can /cancel and try again.")
+            except Exception:
+                pass
     except RuntimeError as e:
         if "No conversation found with session ID" in str(e) and session_id:
             log.warning("Stale session %s, retrying fresh", session_id)
             clear_session(chat_id)
             try:
                 response, new_session_id = await _run_with_updates(update, context, text, None)
-                save_session_id(chat_id, new_session_id)
-                for chunk in _split(response, 4096):
-                    await update.message.reply_text(chunk)
-                images = extract_images(response)
-                if images:
-                    await send_images(chat_id, images, update, context)
+                await deliver(response, new_session_id)
             except CancelledError:
-                await update.message.reply_text("Cancelled.")
+                try:
+                    await reply("Cancelled.")
+                except Exception:
+                    pass
             except Exception as e2:
                 log.error("Error on retry: %s", e2)
-                await update.message.reply_text(f"Error: {e2}")
+                try:
+                    await reply(f"Error: {e2}")
+                except Exception:
+                    pass
         else:
             log.error("Error: %s", e)
-            await update.message.reply_text(f"Error: {e}")
+            try:
+                await reply(f"Error: {e}")
+            except Exception:
+                pass
     except Exception as e:
         log.error("Error: %s", e)
-        await update.message.reply_text(f"Error: {e}")
+        try:
+            await reply(f"Error: {e}")
+        except Exception:
+            pass
     finally:
         busy_chats.discard(chat_id)
 
@@ -743,6 +846,17 @@ async def cmd_sendfile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Failed to send: {e}")
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log Telegram errors without crashing the bot. TimedOut is a normal network hiccup."""
+    err = context.error
+    if isinstance(err, TelegramTimedOut):
+        log.warning("Telegram API timed out (transient): %s", err)
+    elif isinstance(err, TelegramNetworkError):
+        log.warning("Telegram network error (transient): %s", err)
+    else:
+        log.error("Unhandled Telegram error: %s", err, exc_info=err)
+
+
 async def post_init(app) -> None:
     """Clean up leftover status badges from before a restart, then register commands."""
     # On restart, any in-flight status message was left orphaned — clean it up now.
@@ -790,8 +904,10 @@ def main():
     app = (
         ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
-        .connect_timeout(30)
+        .connect_timeout(15)
         .read_timeout(30)
+        .get_updates_connect_timeout(15)
+        .get_updates_read_timeout(35)   # must exceed run_polling(timeout=...) — default is 0 but PTB adds buffer
         .post_init(post_init)
         .build()
     )
@@ -808,6 +924,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.PHOTO, handle_file))
+    app.add_error_handler(error_handler)
     log.info("Bot started. Allowed user ID: %s", ALLOWED_USER_ID)
     app.run_polling()
 
