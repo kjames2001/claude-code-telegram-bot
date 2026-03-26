@@ -510,7 +510,8 @@ def auth(update: Update) -> bool:
 
 HELP_TEXT = (
     "Claude Code bridge — available commands:\n\n"
-    "/cancel — stop the current running command\n"
+    "/cancel — stop the current request and clear all queued messages\n"
+    "/droplast — remove only the last queued message\n"
     "/reset — start a fresh conversation (clears session)\n"
     "/status — show whether Claude is currently busy\n"
     "/id — show your Telegram user & chat IDs\n"
@@ -587,6 +588,27 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if cleared:
         parts.append(f"{cleared} queued message{'s' if cleared > 1 else ''} cleared")
     await update.message.reply_text(", ".join(parts).capitalize() + ".")
+
+
+async def cmd_droplast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not auth(update):
+        return
+    chat_id = update.effective_chat.id
+    queue = chat_queues.get(chat_id)
+    if not queue or queue.empty():
+        await update.message.reply_text("No queued messages.")
+        return
+    try:
+        queue._queue.pop()  # remove last item from the internal deque
+        queue.task_done()
+    except Exception:
+        await update.message.reply_text("Nothing to remove.")
+        return
+    remaining = queue.qsize()
+    msg = "Last queued message removed."
+    if remaining:
+        msg += f" {remaining} still queued."
+    await update.message.reply_text(msg)
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -945,7 +967,8 @@ async def post_init(app) -> None:
         # Bot-native commands
         BotCommand("help",    "Show available commands"),
         BotCommand("reset",   "Start a fresh conversation"),
-        BotCommand("cancel",  "Cancel the running request"),
+        BotCommand("cancel",  "Cancel the running request and clear queue"),
+        BotCommand("droplast", "Remove the last queued message"),
         BotCommand("status",  "Show whether Claude is busy"),
         BotCommand("id",      "Show your Telegram user & chat IDs"),
         # Claude Code commands (passed through to Claude)
@@ -1003,6 +1026,7 @@ def main():
     app.add_handler(CommandHandler("help",    cmd_help))
     app.add_handler(CommandHandler("reset",   cmd_reset))
     app.add_handler(CommandHandler("cancel",  cmd_cancel))
+    app.add_handler(CommandHandler("droplast", cmd_droplast))
     app.add_handler(CommandHandler("status",  cmd_status))
     app.add_handler(CommandHandler("id",      cmd_id))
     app.add_handler(CommandHandler("sendfile", cmd_sendfile))
